@@ -22,13 +22,22 @@ class BottleneckTransformerLayer(nn.Module):
         self.ratio = ratio
         self.p = p
 
-        self.att1 = MultiHeadAttention(dims, heads=heads, p=p)
-        self.att2 = MultiHeadAttention(dims, heads=heads, p=p)
-        self.att3 = MultiHeadAttention(dims, heads=heads, p=p)
-        self.att4 = MultiHeadAttention(dims, heads=heads, p=p)
+        # 原: p 参数 → 现: att_dropout / ffn_dropout
+        self.att1 = MultiHeadAttention(dims, heads=heads,
+                                       att_dropout=p, out_dropout=0.0)
+        self.att2 = MultiHeadAttention(dims, heads=heads,
+                                       att_dropout=p, out_dropout=0.0)
+        self.att3 = MultiHeadAttention(dims, heads=heads,
+                                       att_dropout=p, out_dropout=0.0)
+        self.att4 = MultiHeadAttention(dims, heads=heads,
+                                       att_dropout=p, out_dropout=0.0)
 
-        self.ffn1 = FeedForwardNetwork(dims, ratio=ratio, p=p, act_cfg=act_cfg)
-        self.ffn2 = FeedForwardNetwork(dims, ratio=ratio, p=p, act_cfg=act_cfg)
+        self.ffn1 = FeedForwardNetwork(dims, ratio=ratio,
+                                       ffn_dropout=p, out_dropout=0.0,
+                                       act_cfg=act_cfg)
+        self.ffn2 = FeedForwardNetwork(dims, ratio=ratio,
+                                       ffn_dropout=p, out_dropout=0.0,
+                                       act_cfg=act_cfg)
 
         self.norm1 = build_norm_layer(norm_cfg, dims=dims)
         self.norm2 = build_norm_layer(norm_cfg, dims=dims)
@@ -47,8 +56,8 @@ class BottleneckTransformerLayer(nn.Module):
 
         at = self.att1(dt, ka, da, mask=mask)
         bt = self.att2(dt, kb, db, mask=mask)
-
         t = t + at + bt
+
         dt = self.norm4(t)
 
         qa = da if pe is None else da + pe
@@ -71,7 +80,6 @@ class BottleneckTransformer(nn.Module):
 
     def __init__(self, dims, num_tokens=4, num_layers=1, **kwargs):
         super(BottleneckTransformer, self).__init__()
-
         self.dims = dims
         self.num_tokens = num_tokens
         self.num_layers = num_layers
@@ -86,4 +94,4 @@ class BottleneckTransformer(nn.Module):
         t = self.token.expand(a.size(0), -1, -1)
         for enc in self.encoder:
             a, b, t = enc(a, b, t, **kwargs)
-        return a, b
+        return a, b  # 若后面需要 t，可改为 return a, b, t

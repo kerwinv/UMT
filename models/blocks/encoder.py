@@ -2,8 +2,7 @@
 
 import torch
 import torch.nn as nn
-from nncore.nn import (MODELS, build_linear_modules, build_model,
-                       build_norm_layer)
+from nncore.nn import MODELS, build_linear_modules, build_model, build_norm_layer
 
 
 @MODELS.register()
@@ -41,6 +40,59 @@ class UniModalEncoder(nn.Module):
 
 
 @MODELS.register()
+class CrossModalGate(nn.Module):
+    """
+    跨模态门控:
+      mode=scalar: 全局标量
+      mode=channel: 通道向量
+      mode=channel_token: 通道 + 样本级标量 (轻量 token 维度广播)
+    """
+    def __init__(self, dims, mode='scalar', init_bias=-2.0, min_gate=0.0, dropout=0.0):
+        super().__init__()
+        self.mode = mode
+        self.min_gate = float(min_gate)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        if mode == 'scalar':
+            self.param = nn.Parameter(torch.full((1,), init_bias))
+        elif mode == 'channel':
+            self.param = nn.Parameter(torch.full((dims,), init_bias))
+        elif mode == 'channel_token':
+            self.param = nn.Parameter(torch.full((dims,), init_bias))  # 通道门
+            self.q_proj = nn.Linear(dims, dims, bias=False)
+            self.s_proj = nn.Linear(dims, dims, bias=False)
+            self.mix_proj = nn.Linear(dims, 1, bias=True)  # 生成样本级标量
+        else:
+            raise ValueError(f'Unsupported gate mode: {mode}')
+
+    def _activate(self, raw):
+        g = torch.sigmoid(raw)
+        if self.min_gate > 0:
+            g = self.min_gate + (1 - self.min_gate) * g
+        return g
+
+    def forward(self, target, source):
+        """
+        target: 主模态 (B, Lt, D)
+        source: 被调节模态 (B, Ls, D)
+        """
+        if self.mode == 'scalar':
+            g = self._activate(self.param).view(1, 1, 1)          # (1,1,1)
+            return self.dropout(source * g)
+        if self.mode == 'channel':
+            g = self._activate(self.param).view(1, 1, -1)         # (1,1,D)
+            return self.dropout(source * g)
+        # channel_token
+        B, Ls, D = source.shape
+        tgt_pool = target.mean(dim=1)    # (B,D)
+        src_pool = source.mean(dim=1)    # (B,D)
+        joint = torch.tanh(self.q_proj(tgt_pool) + self.s_proj(src_pool))
+        token_scale = self._activate(self.mix_proj(joint)).view(B, 1, 1)   # (B,1,1)
+        ch_scale = self._activate(self.param).view(1, 1, D)                # (1,1,D)
+        return self.dropout(source * token_scale * ch_scale)
+
+
+@MODELS.register()
 class CrossModalEncoder(nn.Module):
 
     def __init__(self,
@@ -49,6 +101,7 @@ class CrossModalEncoder(nn.Module):
                  pos_cfg=None,
                  enc_cfg=None,
                  norm_cfg=None,
+                 gate_cfg=None,
                  **kwargs):
         super(CrossModalEncoder, self).__init__()
         assert fusion_type in ('sum', 'mean', 'concat')
@@ -61,14 +114,32 @@ class CrossModalEncoder(nn.Module):
         self.mapping = build_linear_modules(map_dims, **kwargs)
         self.norm = build_norm_layer(norm_cfg, dims)
 
-    def forward(self, a, b, **kwargs):
+        self.gate = None
+        if gate_cfg is not None:
+            assert gate_cfg.get('type') == 'CrossModalGate'
+            self.gate = MODELS.build(dict(
+                type='CrossModalGate',
+                dims=dims,
+                mode=gate_cfg.get('mode', 'scalar'),
+                init_bias=gate_cfg.get('init_bias', -2.0),
+                min_gate=gate_cfg.get('min_gate', 0.0),
+                dropout=gate_cfg.get('dropout', 0.0),
+            ))
+
+    def forward(self, x_v, x_a, **kwargs):
+        """
+        x_v: (B, Lv, D) 主模态
+        x_a: (B, La, D) 次模态（被调节）
+        """
         if self.encoder is not None:
-            pe = None if self.pos_enc is None else self.pos_enc(a)
-            a, b = self.encoder(a, b, pe=pe, **kwargs)
+            pe = None if self.pos_enc is None else self.pos_enc(x_v)
+            x_v, x_a = self.encoder(x_v, x_a, pe=pe, **kwargs)
+        if self.gate is not None:
+            x_a = self.gate(x_v, x_a)
         if self.fusion_type in ('sum', 'mean'):
-            x = (a + b) / ((self.fusion_type == 'mean') + 1)
+            x = (x_v + x_a) / ((self.fusion_type == 'mean') + 1)
         else:
-            x = torch.cat((a, b), dim=-1)
+            x = torch.cat((x_v, x_a), dim=-1)
             x = self.mapping(x)
         if self.norm is not None:
             x = self.norm(x)

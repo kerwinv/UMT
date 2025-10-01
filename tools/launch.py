@@ -1,6 +1,15 @@
 # Copyright (c) THL A29 Limited, a Tencent company. All rights reserved.
 
 import argparse
+import torch
+
+# 兼容补丁: 提供 _is_namedtuple
+try:
+    import torch.nn.parallel.scatter_gather as _sg
+    if not hasattr(_sg, "_is_namedtuple") and hasattr(_sg, "is_namedtuple"):
+        _sg._is_namedtuple = _sg.is_namedtuple
+except Exception as e:
+    print("namedtuple patch warn:", e)
 
 import nncore
 from nncore.engine import Engine, comm, set_random_seed
@@ -20,6 +29,7 @@ def parse_args():
 
 
 def main():
+    print("torch version:", torch.__version__)
     args = parse_args()
     cfg = nncore.Config.from_file(args.config)
 
