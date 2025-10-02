@@ -47,49 +47,66 @@ class CrossModalGate(nn.Module):
       mode=channel: 通道向量
       mode=channel_token: 通道 + 样本级标量 (轻量 token 维度广播)
     """
-    def __init__(self, dims, mode='scalar', init_bias=-2.0, min_gate=0.0, dropout=0.0):
+    def __init__(self, dims, mode='channel_token', init_bias=-1.0,
+                 min_gate=0.0, dropout=0.1, learnable_temp=False, reg_l1=0.0):
         super().__init__()
         self.mode = mode
         self.min_gate = float(min_gate)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
+        self.learnable_temp = learnable_temp
+        self.reg_l1 = reg_l1
+        if learnable_temp:
+            self.temp = nn.Parameter(torch.tensor(1.0))
         if mode == 'scalar':
             self.param = nn.Parameter(torch.full((1,), init_bias))
         elif mode == 'channel':
             self.param = nn.Parameter(torch.full((dims,), init_bias))
         elif mode == 'channel_token':
-            self.param = nn.Parameter(torch.full((dims,), init_bias))  # 通道门
+            self.param = nn.Parameter(torch.full((dims,), init_bias))
             self.q_proj = nn.Linear(dims, dims, bias=False)
             self.s_proj = nn.Linear(dims, dims, bias=False)
-            self.mix_proj = nn.Linear(dims, 1, bias=True)  # 生成样本级标量
+            self.mix_proj = nn.Linear(dims, 1, bias=True)
         else:
-            raise ValueError(f'Unsupported gate mode: {mode}')
+            raise ValueError(mode)
 
     def _activate(self, raw):
+        if self.learnable_temp:
+            tau = torch.clamp(self.temp, min=0.1)
+            raw = raw / tau
         g = torch.sigmoid(raw)
         if self.min_gate > 0:
             g = self.min_gate + (1 - self.min_gate) * g
         return g
 
+    def extra_loss(self):
+        if self.reg_l1 <= 0:
+            return 0.0
+        return self.reg_l1 * self.param.abs().mean()
+
     def forward(self, target, source):
-        """
-        target: 主模态 (B, Lt, D)
-        source: 被调节模态 (B, Ls, D)
-        """
+        if target.dim() != 3 or source.dim() != 3:
+            raise ValueError('CrossModalGate expects (B, L, D) tensors.')
+        src = self.dropout(source)
+
         if self.mode == 'scalar':
-            g = self._activate(self.param).view(1, 1, 1)          # (1,1,1)
-            return self.dropout(source * g)
-        if self.mode == 'channel':
-            g = self._activate(self.param).view(1, 1, -1)         # (1,1,D)
-            return self.dropout(source * g)
-        # channel_token
-        B, Ls, D = source.shape
-        tgt_pool = target.mean(dim=1)    # (B,D)
-        src_pool = source.mean(dim=1)    # (B,D)
-        joint = torch.tanh(self.q_proj(tgt_pool) + self.s_proj(src_pool))
-        token_scale = self._activate(self.mix_proj(joint)).view(B, 1, 1)   # (B,1,1)
-        ch_scale = self._activate(self.param).view(1, 1, D)                # (1,1,D)
-        return self.dropout(source * token_scale * ch_scale)
+            gate = self._activate(self.param).view(1, 1, 1)
+            gate = gate.expand_as(src)
+        elif self.mode == 'channel':
+            gate = self._activate(self.param).view(1, 1, -1)
+            gate = gate.expand_as(src)
+        else:  # channel_token
+            channel_gate = self._activate(self.param).view(1, 1, -1)
+            channel_gate = channel_gate.expand_as(src)
+
+            q_ctx = target.mean(dim=1)                  # (B, D)
+            q_proj = self.q_proj(q_ctx).unsqueeze(1)    # (B, 1, D)
+            s_proj = self.s_proj(src)                   # (B, L, D)
+            mix = self.mix_proj(torch.tanh(q_proj + s_proj))  # (B, L, 1)
+            token_gate = self._activate(mix)
+            gate = channel_gate * token_gate
+
+        self._last_gate = gate.detach()
+        return src * gate
 
 
 @MODELS.register()
